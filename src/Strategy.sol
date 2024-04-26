@@ -1,32 +1,142 @@
 // SPDX-License-Identifier: AGPL-3.0
 pragma solidity 0.8.18;
 
-import {BaseStrategy, ERC20} from "@tokenized-strategy/BaseStrategy.sol";
+import {BaseHealthCheck} from "@periphery/Bases/HealthCheck/BaseHealthCheck.sol";
+import {ERC20} from "@tokenized-strategy/BaseStrategy.sol";
+
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-// Import interfaces for many popular DeFi projects, or add your own!
-//import "../interfaces/<protocol>/<Interface>.sol";
+import {IUniswapV3Pool} from "@uniswap-v3-core/interfaces/IUniswapV3Pool.sol";
+import {IUniswapV3SwapCallback} from "@uniswap-v3-core/interfaces/callback/IUniswapV3SwapCallback.sol";
+import {IUniswapV3Factory} from "@uniswap-v3-core/interfaces/IUniswapV3Factory.sol";
 
-/**
- * The `TokenizedStrategy` variable can be used to retrieve the strategies
- * specific storage data your contract.
- *
- *       i.e. uint256 totalAssets = TokenizedStrategy.totalAssets()
- *
- * This can not be used for write functions. Any TokenizedStrategy
- * variables that need to be updated post deployment will need to
- * come from an external call from the strategies specific `management`.
- */
+import {IChainlinkAggregator} from "./interfaces/chainlink/IChainlinkAggregator.sol";
 
-// NOTE: To implement permissioned functions you can use the onlyManagement, onlyEmergencyAuthorized and onlyKeepers modifiers
-
-contract Strategy is BaseStrategy {
+contract Strategy is BaseHealthCheck, IUniswapV3SwapCallback {
     using SafeERC20 for ERC20;
 
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    IUniswapV3Factory internal constant UNISWAP_FACTORY =
+        IUniswapV3Factory(0x1F98431c8aD98523631AE4a59f267346ea31F984);
+
+    uint256 internal constant WAD = 1e18;
+
+    /// @dev The minimum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MIN_TICK)
+    uint160 internal constant UNISWAP_MIN_SQRT_RATIO = 4295128739;
+    /// @dev The maximum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MAX_TICK)
+    uint160 internal constant UNISWAP_MAX_SQRT_RATIO =
+        1461446703485210103287273052203988822378723970342;
+
+    ERC20 public immutable lst;
+    IERC4626 public immutable lstVault;
+    bool private immutable uniswapWeth0Lst1;
+    IChainlinkAggregator public immutable chainlinkOracle;
+    bool public immutable oracleWrapped;
+    bytes4 public immutable unwrappedToWrappedSelector;
+
+    uint16 public slippageAllowedBps = 50; // 0.50%
+    uint16 public maxTendBasefeeGwei = 30; // 30 gwei
+    IUniswapV3Pool public uniswapPool;
+    uint256 public depositLimit;
+
     constructor(
-        address _asset,
-        string memory _name
-    ) BaseStrategy(_asset, _name) {}
+        string memory _name,
+        address _lst,
+        address _lstVault,
+        uint24 _uniswapFee,
+        bytes4 _unwrappedToWrappedSelector,
+        address _chainlinkOracle,
+        bool _oracleWrapped
+    ) BaseHealthCheck(WETH, _name) {
+        require(_lst == IERC4626(_lstVault).asset());
+        lst = ERC20(_lst);
+        lstVault = IERC4626(_lstVault);
+        uniswapWeth0Lst1 = WETH < _lst;
+
+        unwrappedToWrappedSelector = _unwrappedToWrappedSelector;
+        chainlinkOracle = IChainlinkAggregator(_chainlinkOracle);
+        oracleWrapped = _oracleWrapped;
+
+        _setUniswapFee(_uniswapFee);
+        ERC20(_lst).safeApprove(_lstVault, type(uint256).max);
+    }
+
+    /*******************************************
+     *          PUBLIC VIEW FUNCTIONS          *
+     *******************************************/
+
+    /**
+     * @notice A conservative estimate of assets taking into account
+     * the max slippage allowed
+     *
+     * @return . estimated total assets
+     */
+    function estimatedTotalAssets() public view returns (uint256) {
+        return
+            _calculateLstValue(
+                lst.balanceOf(address(this)) +
+                    lstVault.convertToAssets(lstVault.balanceOf(address(this))),
+                _getLstPerWeth()
+            ) + _looseAssets();
+    }
+
+    /**
+     * @notice A liberal estimate of assets not taking into account
+     * the max slippage allowed
+     *
+     * @return . estimated total assets
+     */
+    function estimatedTotalAssetsNoSlippage() public view returns (uint256) {
+        return
+            _calculateLstValue(
+                lst.balanceOf(address(this)) +
+                    lstVault.convertToAssets(lstVault.balanceOf(address(this))),
+                _getLstPerWeth()
+            ) + _looseAssets();
+    }
+
+    /*******************************************
+     *          MANAGEMENT FUNCTIONS           *
+     *******************************************/
+
+    /**
+     * @notice Sets the uniswap fee tier. Can only be called by management
+     * @param _fee The uniswap fee tier to use for Asset<->Weth swaps
+     */
+    function setUniswapFee(uint24 _fee) external onlyManagement {
+        _setUniswapFee(_fee);
+    }
+
+    /**
+     * @notice Sets the deposit limit. Can only be called by management
+     * @param _depositLimit The deposit limit
+     */
+    function setDepositLimit(uint256 _depositLimit) external onlyManagement {
+        depositLimit = _depositLimit;
+    }
+
+    /**
+     * @notice Sets the slippage allowed on swaps. Can only be called by management
+     * @param _slippageAllowedBps The slippage allowed in basis points
+     */
+    function setSlippageAllowedBps(
+        uint16 _slippageAllowedBps
+    ) external onlyManagement {
+        require(_slippageAllowedBps <= MAX_BPS); // dev: cannot be more than 100%
+        slippageAllowedBps = _slippageAllowedBps;
+    }
+
+    /**
+     * @notice Sets the max base fee for tends. Can only be called by management
+     * @param _maxTendBasefeeGwei The maximum base fee allowed in gwei
+     */
+    function setMaxTendBasefeeGwei(
+        uint16 _maxTendBasefeeGwei
+    ) external onlyManagement {
+        maxTendBasefeeGwei = _maxTendBasefeeGwei;
+    }
 
     /*//////////////////////////////////////////////////////////////
                 NEEDED TO BE OVERRIDDEN BY STRATEGIST
@@ -44,9 +154,7 @@ contract Strategy is BaseStrategy {
      * to deposit in the yield source.
      */
     function _deployFunds(uint256 _amount) internal override {
-        // TODO: implement deposit logic EX:
-        //
-        //      lendingPool.deposit(address(asset), _amount ,0);
+        // do nothing
     }
 
     /**
@@ -71,9 +179,19 @@ contract Strategy is BaseStrategy {
      * @param _amount, The amount of 'asset' to be freed.
      */
     function _freeFunds(uint256 _amount) internal override {
-        // TODO: implement withdraw logic EX:
-        //
-        //      lendingPool.withdraw(address(asset), _amount);
+        // 1. scale amount
+        // 2. calculate mix that needs to be withdrawn/swapped
+        uint256 _lstToSwap = (_amount * _getLstPerWeth()) / WAD;
+        uint256 _lstLoose = _looseLst();
+        if (_lstToSwap > _lstLoose) {
+            _lstLoose += lstVault.withdraw(
+                _lstToSwap - _lstLoose,
+                address(this),
+                address(this)
+            );
+        }
+        // 3. Swap lst to wth
+        _swapToWeth(Math.min(_lstToSwap, _lstLoose));
     }
 
     /**
@@ -103,14 +221,8 @@ contract Strategy is BaseStrategy {
         override
         returns (uint256 _totalAssets)
     {
-        // TODO: Implement harvesting logic and accurate accounting EX:
-        //
-        //      if(!TokenizedStrategy.isShutdown()) {
-        //          _claimAndSellRewards();
-        //      }
-        //      _totalAssets = aToken.balanceOf(address(this)) + asset.balanceOf(address(this));
-        //
-        _totalAssets = asset.balanceOf(address(this));
+        adjustPosition(asset.balanceOf(address(this)));
+        _totalAssets = estimatedTotalAssets();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -171,16 +283,13 @@ contract Strategy is BaseStrategy {
      * @param . The address that is depositing into the strategy.
      * @return . The available amount the `_owner` can deposit in terms of `asset`
      *
+     */
     function availableDepositLimit(
-        address _owner
+        address /*_owner */
     ) public view override returns (uint256) {
-        TODO: If desired Implement deposit limit logic and any needed state variables .
-        
-        EX:    
-            uint256 totalAssets = TokenizedStrategy.totalAssets();
-            return totalAssets >= depositLimit ? 0 : depositLimit - totalAssets;
+        uint256 _totalAssets = TokenizedStrategy.totalAssets();
+        return _totalAssets >= depositLimit ? 0 : depositLimit - _totalAssets;
     }
-    */
 
     /**
      * @dev Optional function for strategist to override that can
@@ -203,8 +312,10 @@ contract Strategy is BaseStrategy {
      *
      * @param _totalIdle The current amount of idle funds that are available to deploy.
      *
-    function _tend(uint256 _totalIdle) internal override {}
-    */
+     */
+    function _tend(uint256 _totalIdle) internal override {
+        adjustPosition(_totalIdle);
+    }
 
     /**
      * @dev Optional trigger to override if tend() will be used by the strategy.
@@ -236,13 +347,162 @@ contract Strategy is BaseStrategy {
      *
      * @param _amount The amount of asset to attempt to free.
      *
+     */
     function _emergencyWithdraw(uint256 _amount) internal override {
-        TODO: If desired implement simple logic to free deployed funds.
-
-        EX:
-            _amount = min(_amount, aToken.balanceOf(address(this)));
-            _freeFunds(_amount);
+        _freeFunds(_amount); // TODO: more?
     }
 
-    */
+    /**************************************************
+     *               INTERNAL ACTIONS                 *
+     **************************************************/
+
+    function adjustPosition(uint256 _looseAsset) internal {
+        // 1. convert asset to lst
+        _swapToLst(_looseAsset);
+        // 2. deposit lst in lstVaule
+        uint256 _lstAmount = _looseLst();
+        lstVault.deposit(
+            Math.min(_lstAmount, lstVault.maxDeposit(address(this))),
+            address(this)
+        );
+    }
+
+    /**************************************************
+     *               UNISWAP FUNCTIONS                *
+     **************************************************/
+
+    function _swapToLst(uint256 _wethAmount) internal returns (uint256) {
+        return _swap(_wethAmount, uniswapWeth0Lst1);
+    }
+
+    function _swapToWeth(uint256 _lstAmount) internal returns (uint256) {
+        return _swap(_lstAmount, !uniswapWeth0Lst1);
+    }
+
+    function _swap(
+        uint256 _amount,
+        bool _zeroForOne
+    ) internal returns (uint256) {
+        (int256 amount0Delta, int256 amount1Delta) = uniswapPool.swap(
+            address(this),
+            _zeroForOne,
+            -int256(_amount),
+            (
+                _zeroForOne
+                    ? UNISWAP_MIN_SQRT_RATIO + 1
+                    : UNISWAP_MAX_SQRT_RATIO - 1
+            ),
+            ""
+        );
+
+        return uint256(_zeroForOne ? amount1Delta : amount0Delta);
+    }
+
+    /// @inheritdoc IUniswapV3SwapCallback
+    function uniswapV3SwapCallback(
+        int256 _amount0Delta,
+        int256 _amount1Delta,
+        bytes calldata /* _data */
+    ) external {
+        require(msg.sender == address(uniswapPool)); // dev: callback only called by pool
+        require(_amount0Delta > 0 || _amount1Delta > 0); // dev: swaps entirely within 0-liquidity regions are not supported
+
+        (
+            ERC20 _inputToken,
+            uint256 _amountToPay,
+            uint256 _amountReceived
+        ) = _amount0Delta > 0
+                ? (
+                    uniswapWeth0Lst1 ? ERC20(WETH) : lst,
+                    uint256(_amount0Delta),
+                    uint256(-_amount1Delta)
+                )
+                : (
+                    !uniswapWeth0Lst1 ? ERC20(WETH) : lst,
+                    uint256(_amount1Delta),
+                    uint256(-_amount0Delta)
+                );
+        _inputToken.transfer(msg.sender, _amountToPay);
+    }
+
+    /**************************************************
+     *               INTERNAL VIEWS                   *
+     **************************************************/
+
+    /**
+     *  @notice Returns the strategy assets which are held as loose asset
+     *  @return . The strategy's loose asset
+     */
+    function _looseAssets() internal view returns (uint256) {
+        return asset.balanceOf(address(this));
+    }
+
+    /**
+     *  @notice Returns the strategy lst which are held as loose lst
+     *  @return . The strategy's loose lst
+     */
+    function _looseLst() internal view returns (uint256) {
+        return lst.balanceOf(address(this));
+    }
+
+    /**
+     *  @notice Retrieves the oracle rate asset/quoteToken
+     *  @return Conversion rate
+     */
+    function _getLstPerWeth() internal view returns (uint256) {
+        uint256 _answer = (WAD ** 2) / uint256(chainlinkOracle.latestAnswer());
+        if (oracleWrapped) {
+            return _answer;
+        }
+        return _unwrappedToWrappedAsset(_answer);
+    }
+
+    function _unwrappedToWrappedAsset(
+        uint256 _amount
+    ) internal view returns (uint256) {
+        (bool success, bytes memory data) = address(asset).staticcall(
+            abi.encodeWithSelector(unwrappedToWrappedSelector, _amount)
+        );
+        require(success, "!success"); // dev: static call failed
+        return abi.decode(data, (uint256));
+    }
+
+    /**************************************************
+     *               INTERNAL SETTERS                 *
+     **************************************************/
+
+    function _setUniswapFee(uint24 _fee) internal {
+        IUniswapV3Pool _uniswapPool = IUniswapV3Pool(
+            UNISWAP_FACTORY.getPool(WETH, address(lst), _fee)
+        );
+        require(
+            _uniswapPool.token0() == address(WETH) ||
+                _uniswapPool.token1() == address(WETH)
+        ); // dev: pool must contain weth
+        require(
+            _uniswapPool.token0() == address(lst) ||
+                _uniswapPool.token1() == address(lst)
+        ); // dev: pool must contain weth
+        uniswapPool = _uniswapPool;
+    }
+
+    /**************************************************
+     *                INTERNAL HELPERS                *
+     **************************************************/
+
+    function _calculateLstValueWithMaxSlippage(
+        uint256 _lstAmount,
+        uint256 _lstPerWeth
+    ) internal pure returns (uint256) {
+        return _calculateLstValue(_lstAmount, _lstPerWeth);
+    }
+
+    function _calculateLstValue(
+        uint256 _lstAmount,
+        uint256 _lstPerWeth
+    ) internal pure returns (uint256) {
+        if (_lstAmount == 0 || _lstPerWeth == 0) return 0;
+
+        return (_lstAmount * WAD) / _lstPerWeth;
+    }
 }
